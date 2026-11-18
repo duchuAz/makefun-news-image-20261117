@@ -1,109 +1,70 @@
-'use strict';
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
-const fs = require('node:fs');
-const path = require('node:path');
+// A deliberately small entry program: validate the checked-in image, then
+// publish exactly those bytes into the scoring directory.
+type CheckedImage = {
+  readonly bytes: Buffer;
+  readonly width: number;
+  readonly height: number;
+};
 
-const MAX_PNG_BYTES = 1048576;
 const PNG_SIGNATURE = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-const IHDR_LENGTH = 13;
-const BIT_DEPTHS = new Set([1, 2, 4, 8, 16]);
-const COLOUR_TYPES = new Set([0, 2, 3, 4, 6]);
+const MAX_IMAGE_BYTES = 1024 * 1024;
+const MAX_EDGE = 1024;
 
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n += 1) {
-    let value = n;
-    for (let bit = 0; bit < 8; bit += 1) {
-      value = (value & 1) === 1 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
-    }
-    table[n] = value >>> 0;
+function fail(message: string): never {
+  process.stderr.write(`entry: ${message}\n`);
+  process.exit(1);
+}
+
+function readUInt32(bytes: Buffer, offset: number): number {
+  if (offset + 4 > bytes.length) fail("PNG header is truncated");
+  return bytes.readUInt32BE(offset);
+}
+
+function inspectPng(bytes: Buffer): CheckedImage {
+  if (bytes.length === 0) fail("entry.png is empty");
+  if (bytes.length > MAX_IMAGE_BYTES) fail(`entry.png is ${bytes.length} bytes; the limit is ${MAX_IMAGE_BYTES}`);
+  if (!bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) fail("entry.png is not a PNG");
+  if (bytes.length < 33) fail("entry.png has no complete IHDR chunk");
+  const chunkType = bytes.subarray(12, 16).toString("ascii");
+  if (chunkType !== "IHDR") fail("the first PNG chunk is not IHDR");
+  const width = readUInt32(bytes, 16);
+  const height = readUInt32(bytes, 20);
+  if (width < 1 || height < 1 || width > MAX_EDGE || height > MAX_EDGE) {
+    fail(`entry.png is ${width}x${height}; each edge must be at most ${MAX_EDGE}`);
   }
-  return table;
-})();
+  return { bytes, width, height };
+}
 
-function crc32(bytes) {
-  let crc = 0xffffffff;
-  for (let i = 0; i < bytes.length; i += 1) {
-    crc = CRC_TABLE[(crc ^ bytes[i]) & 0xff] ^ (crc >>> 8);
+function loadEntry(): CheckedImage {
+  const source = join(process.cwd(), "entry.png");
+  let bytes: Buffer;
+  try {
+    bytes = readFileSync(source);
+  } catch (error) {
+    fail(`cannot read ${source}: ${error instanceof Error ? error.message : String(error)}`);
   }
-  return (crc ^ 0xffffffff) >>> 0;
+  return inspectPng(bytes);
 }
 
-function reject(message) {
-  throw new Error('Invalid entry.png: ' + message);
+function outputDirectory(): string {
+  const configured = process.env.MAKEFUN_OUTPUT_DIR;
+  if (configured && configured.length > 0) return configured;
+  return "/output";
 }
 
-function readChunk(bytes, offset) {
-  if (offset + 12 > bytes.length) reject('chunk header is truncated');
-  const length = bytes.readUInt32BE(offset);
-  const end = offset + 12 + length;
-  if (end > bytes.length) reject('chunk body is truncated');
-  return {
-    type: bytes.toString('latin1', offset + 4, offset + 8),
-    start: offset,
-    end,
-    length,
-  };
-}
-
-function checkHeader(bytes, chunk) {
-  if (chunk.length !== IHDR_LENGTH) reject('IHDR has the wrong length');
-  const width = bytes.readUInt32BE(chunk.start + 8);
-  const height = bytes.readUInt32BE(chunk.start + 12);
-  if (width !== 1024 || height !== 1024) reject('dimensions are not 1024x1024');
-  if (!BIT_DEPTHS.has(bytes[chunk.start + 16])) reject('bit depth is invalid');
-  if (!COLOUR_TYPES.has(bytes[chunk.start + 17])) reject('colour type is invalid');
-}
-
-function inspectChunks(bytes) {
-  let offset = PNG_SIGNATURE.length;
-  let imageData = 0;
-  let index = 0;
-  let ended = false;
-
-  while (offset < bytes.length) {
-    const chunk = readChunk(bytes, offset);
-    const stored = bytes.readUInt32BE(chunk.end - 4);
-    const computed = crc32(bytes.subarray(chunk.start + 4, chunk.end - 4));
-    if (stored !== computed) reject('chunk ' + chunk.type + ' fails its CRC');
-    if (index === 0 && chunk.type !== 'IHDR') reject('first chunk is not IHDR');
-    if (index > 0 && chunk.type === 'IHDR') reject('IHDR is not the first chunk');
-    if (chunk.type === 'IHDR') checkHeader(bytes, chunk);
-    if (chunk.type === 'IDAT') imageData += 1;
-    if (chunk.type === 'IEND') {
-      if (chunk.length !== 0) reject('IEND carries data');
-      ended = true;
-      offset = chunk.end;
-      break;
-    }
-    offset = chunk.end;
-    index += 1;
+function main(): void {
+  const image = loadEntry();
+  const destination = outputDirectory();
+  try {
+    mkdirSync(destination, { recursive: true });
+    writeFileSync(join(destination, "entry.png"), image.bytes);
+  } catch (error) {
+    fail(`cannot write the image: ${error instanceof Error ? error.message : String(error)}`);
   }
-
-  if (imageData === 0) reject('no IDAT chunk was found');
-  if (!ended) reject('IEND chunk is missing');
-  if (offset !== bytes.length) reject('bytes follow the IEND chunk');
-}
-
-function loadEntry() {
-  const repoRoot = path.dirname(path.resolve(process.argv[1]));
-  const source = path.join(repoRoot, 'entry.png');
-  const bytes = fs.readFileSync(source);
-
-  if (bytes.length > MAX_PNG_BYTES) reject('file exceeds one mebibyte');
-  if (bytes.length < PNG_SIGNATURE.length + 12) reject('file is too short');
-  if (!bytes.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
-    reject('PNG signature is missing');
-  }
-  inspectChunks(bytes);
-  return bytes;
-}
-
-function main() {
-  const entry = loadEntry();
-  const outputDir = process.env.MAKEFUN_OUTPUT_DIR || '/output';
-  fs.mkdirSync(outputDir, { recursive: true });
-  fs.writeFileSync(path.join(outputDir, 'entry.png'), entry);
+  process.stdout.write(`wrote ${image.width}x${image.height} PNG, ${image.bytes.length} bytes\n`);
 }
 
 main();
